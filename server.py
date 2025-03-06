@@ -20,6 +20,11 @@ output_layers = [layer_names[i - 1] for i in yolo.getUnconnectedOutLayers()]
 colorRed = (0, 0, 255)
 colorGreen = (0, 255, 0)
 
+@app.route('/')
+def home():
+    return "Flask server is running!"
+
+
 @app.route("/process-image/", methods=["POST"])
 def process_image():
     # Read image from the uploaded file
