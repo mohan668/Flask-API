@@ -6,17 +6,29 @@ import os
 app = Flask(__name__)
 
 # Load YOLO model
-yolo = cv2.dnn.readNet("yolov3.weights", "yolov3.cfg")
+try:
+    yolo = cv2.dnn.readNet("yolov3.weights", "yolov3.cfg")
+except Exception as e:
+    print("Error loading YOLO model:", e)
+    raise
 
 # Load class labels
-classes = []
-with open("coco.names", "r") as file:
-    classes = [line.strip() for line in file.readlines()]
+try:
+    with open("coco.names", "r") as file:
+        classes = [line.strip() for line in file.readlines()]
+except Exception as e:
+    print("Error loading coco.names:", e)
+    classes = []
 
+# Get layer names and output layers from YOLO
 layer_names = yolo.getLayerNames()
-output_layers = [layer_names[i - 1] for i in yolo.getUnconnectedOutLayers()]
+# Flatten in case getUnconnectedOutLayers returns a 2D array (OpenCV version dependent)
+unconnected = yolo.getUnconnectedOutLayers()
+if hasattr(unconnected, "flatten"):
+    unconnected = unconnected.flatten()
+output_layers = [layer_names[i - 1] for i in unconnected]
 
-# Colors for drawing
+# Colors for drawing bounding boxes and text
 colorRed = (0, 0, 255)
 colorGreen = (0, 255, 0)
 
@@ -24,94 +36,110 @@ colorGreen = (0, 255, 0)
 def home():
     return "Flask server is running!"
 
-
 @app.route("/process-image/", methods=["POST"])
 def process_image():
-    # Read image from the uploaded file
-    file = request.files['file']
-    nparr = np.frombuffer(file.read(), np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    try:
+        # Verify that a file is provided
+        if 'file' not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
 
-    height, width, channels = img.shape
+        # Read image from the uploaded file into a NumPy array
+        nparr = np.frombuffer(file.read(), np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return jsonify({"error": "Invalid image data"}), 400
 
-    # Image center
-    image_center_x = width // 2
-    image_center_y = height // 2
+        height, width, channels = img.shape
 
-    # Determine scaling factor based on image shape
-    if width == height:
-        scale_x = 5 / (width // 2)
-        scale_y = 5 / (height // 2)
-    else:
-        scale_x = 10 / (width // 2)
-        scale_y = 5 / (height // 2)
+        # Calculate image center
+        image_center_x = width // 2
+        image_center_y = height // 2
 
-    # Prepare the image for YOLO
-    blob = cv2.dnn.blobFromImage(img, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
-    yolo.setInput(blob)
-    outputs = yolo.forward(output_layers)
+        # Determine scaling factors based on image dimensions
+        if width == height:
+            scale_x = 5 / (width // 2)
+            scale_y = 5 / (height // 2)
+        else:
+            scale_x = 10 / (width // 2)
+            scale_y = 5 / (height // 2)
 
-    class_ids = []
-    confidences = []
-    boxes = []
+        # Prepare the image for YOLO detection
+        blob = cv2.dnn.blobFromImage(img, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
+        yolo.setInput(blob)
+        outputs = yolo.forward(output_layers)
 
-    # Process YOLO outputs
-    for output in outputs:
-        for detection in output:
-            scores = detection[5:]
-            class_id = np.argmax(scores)
-            confidence = scores[class_id]
+        class_ids = []
+        confidences = []
+        boxes = []
 
-            if confidence > 0.5:
-                center_x = int(detection[0] * width)
-                center_y = int(detection[1] * height)
-                w = int(detection[2] * width)
-                h = int(detection[3] * height)
+        # Process YOLO outputs
+        for output in outputs:
+            for detection in output:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
 
-                x = int(center_x - w / 2)
-                y = int(center_y - h / 2)
+                if confidence > 0.5:
+                    center_x_det = int(detection[0] * width)
+                    center_y_det = int(detection[1] * height)
+                    w = int(detection[2] * width)
+                    h = int(detection[3] * height)
 
-                boxes.append([x, y, w, h])
-                confidences.append(float(confidence))
-                class_ids.append(class_id)
+                    x = int(center_x_det - w / 2)
+                    y = int(center_y_det - h / 2)
 
-    # Non-Maximum Suppression to reduce overlapping boxes
-    indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+                    boxes.append([x, y, w, h])
+                    confidences.append(float(confidence))
+                    class_ids.append(class_id)
 
-    # Find box with highest confidence
-    coordinates = {}
-    if len(indexes) > 0:
-        max_conf_index = np.argmax(confidences)
-        if max_conf_index in indexes:
+        # Apply Non-Maximum Suppression to reduce overlapping boxes
+        indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+        if hasattr(indexes, "flatten"):
+            indexes = indexes.flatten()
+        
+        coordinates = {}
+        if len(indexes) > 0:
+            # Select the box with the highest confidence among those kept by NMS
+            max_conf_index = max(indexes, key=lambda i: confidences[i])
             x, y, w, h = boxes[max_conf_index]
             label = str(classes[class_ids[max_conf_index]])
 
-            # Calculate center point of the detected object
-            center_x = x + w // 2
-            center_y = y + h // 2
+            # Calculate center of detected object
+            center_x_box = x + w // 2
+            center_y_box = y + h // 2
 
-            # Calculate new coordinate system relative to image center
-            relative_x = (center_x - image_center_x) * scale_x
-            relative_y = (image_center_y - center_y) * scale_y
+            # Calculate relative coordinates with respect to image center
+            relative_x = (center_x_box - image_center_x) * scale_x
+            relative_y = (image_center_y - center_y_box) * scale_y
 
-            # Draw the bounding box
+            # Draw bounding box and coordinate text on the image
             cv2.rectangle(img, (x, y), (x + w, y + h), colorGreen, 3)
-
-            # Display the scaled coordinates on the top-left corner
             coord_text = f"({relative_x:.2f}, {relative_y:.2f})"
             cv2.putText(img, coord_text, (x, y - 10), cv2.FONT_HERSHEY_PLAIN, 2, colorRed, 2)
 
             coordinates = {"x": round(relative_x, 2), "y": round(relative_y, 2)}
 
-    # Save output image
-    output_path = "output.jpg"
-    cv2.imwrite(output_path, img)
+        # Save the processed image to disk
+        output_path = "output.jpg"
+        cv2.imwrite(output_path, img)
 
-    return jsonify({"coordinates": coordinates, "image_url": "/download-image/"})
+        return jsonify({"coordinates": coordinates, "image_url": "/download-image/"})
+    
+    except Exception as e:
+        print("Error in /process-image:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/download-image/", methods=["GET"])
 def download_image():
-    return send_file("output.jpg", mimetype='image/jpeg')
+    try:
+        return send_file("output.jpg", mimetype='image/jpeg')
+    except Exception as e:
+        print("Error in /download-image:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     print("Flask server running...")
